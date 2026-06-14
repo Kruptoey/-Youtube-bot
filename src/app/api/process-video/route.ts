@@ -1,0 +1,62 @@
+import { NextResponse } from "next/server";
+import { inngest } from "@/inngest/client";
+import { supabaseAdmin as supabase } from "@/lib/supabase-admin";
+
+export async function POST(req: Request) {
+  try {
+    const { youtubeUrl, personaId } = await req.json();
+
+    if (!youtubeUrl) {
+      return NextResponse.json({ error: "YouTube URL is required" }, { status: 400 });
+    }
+
+    // Basic extraction of video ID
+    let videoId = "unknown";
+    try {
+      const urlObj = new URL(youtubeUrl);
+      if (youtubeUrl.includes("youtu.be")) {
+        videoId = urlObj.pathname.slice(1);
+      } else {
+        videoId = urlObj.searchParams.get("v") || "unknown";
+      }
+    } catch (e) {
+      // Ignore URL parsing errors, use fallback
+    }
+
+    // Create a draft record in Supabase
+    const { data, error } = await supabase
+      .from("videos")
+      .insert([
+        { 
+          youtube_url: youtubeUrl, 
+          video_id: videoId,
+          persona_id: personaId || null,
+          status: "DRAFT" 
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) {
+      console.error("Supabase insert error:", error);
+      return NextResponse.json({ error: "Database error" }, { status: 500 });
+    }
+
+    const dbRecordId = data.id;
+
+    // Trigger Inngest Background Job
+    await inngest.send({
+      name: "video/process.requested",
+      data: {
+        videoId: dbRecordId,
+        youtubeUrl: youtubeUrl,
+        personaId: personaId
+      }
+    });
+
+    return NextResponse.json({ success: true, videoId: dbRecordId });
+  } catch (error: any) {
+    console.error("Process API Error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
