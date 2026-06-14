@@ -15,7 +15,13 @@ export default function DashboardPage() {
   const [personas, setPersonas] = useState<any[]>([]);
   const [selectedPersonaId, setSelectedPersonaId] = useState("");
   const [qualityMode, setQualityMode] = useState("Standard");
-  const [directorsNote, setDirectorsNote] = useState("");
+  const defaultDirectorsNote = `วิดีโอนี้เป็นคลิปติวสอบระดับมหาวิทยาลัย (Academic/Tutoring) ให้ปรับ Tone & Voice ทั้งหมดเป็นแบบมืออาชีพ น่าเชื่อถือ และตรงไปตรงมา
+
+1. การตั้งชื่อคลิป (Title): ห้ามใช้ Clickbait หรือคำหวือหวาเด็ดขาด ให้ใช้โครงสร้างที่ชัดเจน ค้นหาง่าย เช่น [ชื่อวิชา] + [หัวข้อที่สอน] + [จุดประสงค์ เช่น ติวสอบไฟนอล/สรุปเนื้อหา] 
+2. คำอธิบาย (Description): ให้เขียนแบบสรุปเนื้อหาทางการเรียนอย่างเป็นระบบ ระบุชัดเจนว่าคลิปนี้เหมาะกับใคร (เช่น นักศึกษาวิศวะ/วิทยาศาสตร์) และสิ่งที่เด็กจะได้เรียนรู้จากคลิปนี้ 
+3. Thumbnail Text: ให้ดึง Keyword หลักของบทเรียนมาใช้แค่ 1-3 คำเท่านั้น เน้นความชัดเจนและอ่านง่ายที่สุด เช่น 'หา Curl', 'Calculus 2', 'ติวไฟนอล' ห้ามใช้ประโยคยาวๆ`;
+
+  const [directorsNote, setDirectorsNote] = useState(defaultDirectorsNote);
   const router = useRouter();
 
   useEffect(() => {

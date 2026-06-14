@@ -1,8 +1,12 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { inngest } from "@/inngest/client";
 import { supabaseAdmin as supabase } from "@/lib/supabase-admin";
+import { requireUser } from "@/lib/api-auth";
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
+  const unauthorized = await requireUser(req);
+  if (unauthorized) return unauthorized;
+
   try {
     const { youtubeUrl, personaId, qualityMode, directorsNote } = await req.json();
 

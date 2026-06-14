@@ -1,82 +1,129 @@
 "use client";
 
-import { useState, useEffect, use } from "react";
+import { useState, useEffect, useCallback, useRef, use } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Check, RefreshCw, UploadCloud, AlertTriangle } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+
+// Fetch video status via the server-side API route instead of querying Supabase
+// directly from the browser. The direct browser query relies on a valid user JWT
+// in cookies; if the cookie is absent or stale, RLS silently returns 0 rows and
+// the page shows "LOADING" forever. The API route uses supabaseAdmin (service role)
+// so it always sees the record regardless of the browser's auth state.
+async function fetchVideoStatus(id: string): Promise<{ data: any | null; error: string | null }> {
+  try {
+    const res = await fetch(`/api/videos/${id}/status`);
+    if (res.status === 404) return { data: null, error: null };
+    const json = await res.json();
+    if (!res.ok) return { data: null, error: json.error ?? "Server error" };
+    return { data: json, error: null };
+  } catch {
+    return { data: null, error: "Network error" };
+  }
+}
 
 export default function PreviewPage({ params }: { params: Promise<{ id: string }> }) {
   const router = useRouter();
   const { id } = use(params);
-  
+
   const [loading, setLoading] = useState(false);
   const [video, setVideo] = useState<any>(null);
-  
-  // Polling to fetch real video data
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    
-    const fetchVideo = async () => {
-      const { data } = await supabase.from("videos").select("*").eq("id", id).single();
-      if (data) {
-        setVideo(data);
-        if (data.status === "COMPLETED" || data.status === "FAILED") {
-          clearInterval(interval);
-        }
-      }
-    };
+  const [pollError, setPollError] = useState<string | null>(null);
 
+  // useRef so both useEffect and handleApprove can start/stop the same interval
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  const clearPoll = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  const fetchVideo = useCallback(async () => {
+    const { data, error } = await fetchVideoStatus(id);
+
+    if (error) {
+      console.error("[preview] poll error:", error);
+      setPollError(error);
+      return;
+    }
+
+    setPollError(null);
+    if (data) {
+      setVideo(data);
+      // Stop the processing poll at stable states:
+      // - PENDING_APPROVAL: AI is done, user is reviewing — stop to prevent overwriting edits
+      // - COMPLETED / FAILED: pipeline finished — no more polling needed
+      // NOTE: UPLOADING_TO_YOUTUBE is intentionally excluded — polling must continue
+      //       to detect when upload finishes and status becomes COMPLETED.
+      if (["COMPLETED", "FAILED", "PENDING_APPROVAL"].includes(data.status)) {
+        clearPoll();
+      }
+    }
+  }, [id, clearPoll]);
+
+  useEffect(() => {
     fetchVideo();
-    interval = setInterval(fetchVideo, 3000);
-    
-    return () => clearInterval(interval);
-  }, [id]);
+    intervalRef.current = setInterval(fetchVideo, 3000);
+    return clearPoll; // cleanup on unmount or id change
+  }, [id, fetchVideo, clearPoll]);
 
   const handleApprove = async () => {
     if (!video) return;
     setLoading(true);
-    
-    // Save any manual edits to DB first
-    await supabase.from("videos").update({
-      generated_title: video.generated_title,
-      generated_description: video.generated_description,
-      generated_tags: Array.isArray(video.generated_tags) ? video.generated_tags : video.generated_tags?.split(',').map((t: string) => t.trim())
-    }).eq("id", id);
 
     try {
-      // Trigger Inngest background upload
+      // Send the inline edits in the request body. The route persists them with the
+      // service-role client (off the RLS-gated browser client) BEFORE queueing the
+      // upload, so a stale auth cookie can no longer cause the old draft to be uploaded.
       const res = await fetch(`/api/videos/${id}/approve`, {
-        method: "POST"
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          generated_title: video.generated_title,
+          generated_description: video.generated_description,
+          generated_tags: video.generated_tags,
+        }),
       });
-      
+
       if (res.ok) {
-        // UI will update automatically on next poll since status will change to UPLOADING_TO_YOUTUBE
+        // Restart polling so the UI detects UPLOADING_TO_YOUTUBE → COMPLETED transition.
+        // fetchVideo is stable (useCallback) and accessible here because of the useRef pattern.
+        intervalRef.current = setInterval(fetchVideo, 3000);
       } else {
-        const errorData = await res.json();
-        alert("Error queuing update: " + errorData.error);
+        const errorData = await res.json().catch(() => ({}));
+        alert("Error queuing update: " + (errorData.error ?? res.statusText));
         setLoading(false);
       }
-    } catch (e) {
+    } catch {
       alert("Network error");
       setLoading(false);
     }
   };
 
-  if (!video || video.status === "DRAFT" || video.status === "EXTRACTING_AUDIO" || video.status === "AI_ANALYZING") {
+  // ── Processing (DRAFT / EXTRACTING_AUDIO / AI_ANALYZING / no data yet) ──────
+  if (!video || ["DRAFT", "EXTRACTING_AUDIO", "AI_ANALYZING"].includes(video.status)) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
         <RefreshCw className="w-12 h-12 animate-spin text-primary" />
         <h2 className="text-2xl font-bold">AI is analyzing the video...</h2>
         <p className="text-gray-500">This might take a minute or two depending on the video length.</p>
-        <p className="text-sm font-mono text-gray-400">Current State: {video?.status || "LOADING"}</p>
+        <p className="text-sm font-mono text-gray-400">Current State: {video?.status ?? "LOADING"}</p>
+        {pollError && (
+          <div className="text-xs text-red-500 font-mono bg-red-50 border border-red-200 p-3 rounded max-w-md break-all text-left">
+            <strong>DB Error (check .env.local + Supabase RLS):</strong>
+            <br />
+            {pollError}
+          </div>
+        )}
       </div>
     );
   }
 
+  // ── Uploading ─────────────────────────────────────────────────────────────────
   if (video.status === "UPLOADING_TO_YOUTUBE") {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
@@ -87,6 +134,7 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     );
   }
 
+  // ── Complete ──────────────────────────────────────────────────────────────────
   if (video.status === "COMPLETED") {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
@@ -98,6 +146,7 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     );
   }
 
+  // ── Failed ────────────────────────────────────────────────────────────────────
   if (video.status === "FAILED") {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4 text-center px-4">
@@ -111,21 +160,21 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     );
   }
 
-  // PENDING_APPROVAL State
+  // ── PENDING_APPROVAL (default) ────────────────────────────────────────────────
   return (
     <div className="max-w-4xl mx-auto space-y-6 pb-12">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold tracking-tight">Review & Approve</h2>
-        <div className="space-x-2">
-          <Button onClick={handleApprove} disabled={loading} className="bg-green-600 hover:bg-green-700">
-            {loading ? "Approving..." : (
-              <>
-                <Check className="w-4 h-4 mr-2" />
-                Approve & Update
-              </>
-            )}
-          </Button>
-        </div>
+        <Button onClick={handleApprove} disabled={loading} className="bg-green-600 hover:bg-green-700">
+          {loading ? (
+            "Approving..."
+          ) : (
+            <>
+              <Check className="w-4 h-4 mr-2" />
+              Approve & Update
+            </>
+          )}
+        </Button>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -135,16 +184,16 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
             <CardDescription>Generated via Edge Satori (HTML to Image)</CardDescription>
           </CardHeader>
           <CardContent>
-            {/* Fetch real OG image from our API */}
             <div className="relative w-full aspect-video rounded-lg overflow-hidden border border-gray-200 shadow-sm">
-               <img 
-                 src={`/api/og?videoId=${video.id}`} 
-                 alt="Thumbnail Preview" 
-                 className="w-full h-full object-cover"
-                 onError={(e) => {
-                   (e.target as HTMLImageElement).src = "https://placehold.co/1280x720/e2e8f0/64748b?text=Preview+Loading...";
-                 }}
-               />
+              <img
+                src={`/api/og?videoId=${video.id}`}
+                alt="Thumbnail Preview"
+                className="w-full h-full object-cover"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).src =
+                    "https://placehold.co/1280x720/e2e8f0/64748b?text=Preview+Loading...";
+                }}
+              />
             </div>
           </CardContent>
         </Card>
@@ -159,7 +208,11 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
               value={video.generated_title || ""}
               onChange={(e) => setVideo({ ...video, generated_title: e.target.value })}
             />
-            <p className={`text-xs mt-2 text-right ${video.generated_title?.length > 100 ? 'text-red-500' : 'text-gray-500'}`}>
+            <p
+              className={`text-xs mt-2 text-right ${
+                video.generated_title?.length > 100 ? "text-red-500" : "text-gray-500"
+              }`}
+            >
               {video.generated_title?.length || 0} / 100 chars
             </p>
           </CardContent>
@@ -171,7 +224,11 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
           </CardHeader>
           <CardContent>
             <Input
-              value={Array.isArray(video.generated_tags) ? video.generated_tags.join(", ") : video.generated_tags || ""}
+              value={
+                Array.isArray(video.generated_tags)
+                  ? video.generated_tags.join(", ")
+                  : video.generated_tags || ""
+              }
               onChange={(e) => setVideo({ ...video, generated_tags: e.target.value })}
             />
           </CardContent>
