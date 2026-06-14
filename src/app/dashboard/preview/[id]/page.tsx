@@ -24,10 +24,8 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
       const { data } = await supabase.from("videos").select("*").eq("id", id).single();
       if (data) {
         setVideo(data);
-        // If still processing, keep polling
-        if (data.status === "COMPLETED" || data.status === "UPLOADING_TO_YOUTUBE" || data.status === "FAILED") {
-          // Stop polling if done or uploading
-          // Actually, if UPLOADING_TO_YOUTUBE, we might want to poll until COMPLETED
+        if (data.status === "COMPLETED" || data.status === "FAILED") {
+          clearInterval(interval);
         }
       }
     };

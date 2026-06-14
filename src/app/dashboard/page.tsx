@@ -7,20 +7,27 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { fetchPersonasAction } from "./settings/actions";
 
 export default function DashboardPage() {
   const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [personas, setPersonas] = useState<any[]>([]);
   const [selectedPersonaId, setSelectedPersonaId] = useState("");
+  const [qualityMode, setQualityMode] = useState("Standard");
+  const [directorsNote, setDirectorsNote] = useState("");
   const router = useRouter();
 
   useEffect(() => {
     const fetchPersonas = async () => {
-      const { data } = await supabase.from("ai_personas").select("*").order("created_at", { ascending: true });
-      if (data && data.length > 0) {
-        setPersonas(data);
-        setSelectedPersonaId(data[0].id); // Select first by default
+      const res = await fetchPersonasAction();
+      if (res.success && res.data && res.data.length > 0) {
+        // Filter out system personas so they don't clutter the main selector
+        const userPersonas = res.data.filter((p: any) => !p.name.startsWith("System -") && !p.name.startsWith("[DELETED] "));
+        if (userPersonas.length > 0) {
+          setPersonas(userPersonas);
+          setSelectedPersonaId(userPersonas[0].id); // Select first by default
+        }
       }
     };
     fetchPersonas();
@@ -36,7 +43,7 @@ export default function DashboardPage() {
       const res = await fetch("/api/process-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ youtubeUrl: url, personaId: selectedPersonaId }),
+        body: JSON.stringify({ youtubeUrl: url, personaId: selectedPersonaId, qualityMode, directorsNote }),
       });
       
       if (!res.ok) throw new Error("Failed to start processing");
@@ -56,12 +63,12 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="max-w-2xl mx-auto">
+    <div className="max-w-2xl mx-auto pb-12">
       <Card>
         <CardHeader>
           <CardTitle>Create AI Automation</CardTitle>
           <CardDescription>
-            Paste a YouTube URL below to let AI generate a new Title, Description, Tags, and Thumbnail.
+            Paste a YouTube URL below to let our 6-Agent Virtual Agency generate the absolute perfect metadata.
           </CardDescription>
         </CardHeader>
         <form onSubmit={handleSubmit}>
@@ -80,24 +87,56 @@ export default function DashboardPage() {
               </p>
             </div>
 
-            <div className="space-y-2 border-t pt-4">
-              <Label htmlFor="persona-select">Select AI Persona</Label>
-              {personas.length === 0 ? (
-                <p className="text-sm text-orange-500">No personas found. Default AI will be used.</p>
-              ) : (
+            <div className="grid grid-cols-2 gap-4 border-t pt-4">
+              <div className="space-y-2">
+                <Label htmlFor="persona-select">Creative Director (Your Persona)</Label>
+                {personas.length === 0 ? (
+                  <p className="text-sm text-orange-500">No personas found. Default AI will be used.</p>
+                ) : (
+                  <select 
+                    id="persona-select"
+                    className="w-full border rounded-md p-2 text-sm bg-white"
+                    value={selectedPersonaId}
+                    onChange={(e) => setSelectedPersonaId(e.target.value)}
+                  >
+                    {personas.map(p => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="quality-select">Quality Mode (Agentic Loops)</Label>
                 <select 
-                  id="persona-select"
+                  id="quality-select"
                   className="w-full border rounded-md p-2 text-sm bg-white"
-                  value={selectedPersonaId}
-                  onChange={(e) => setSelectedPersonaId(e.target.value)}
+                  value={qualityMode}
+                  onChange={(e) => setQualityMode(e.target.value)}
                 >
-                  {personas.map(p => (
-                    <option key={p.id} value={p.id}>
-                      {p.name} ({p.provider.toUpperCase()} - {p.model})
-                    </option>
-                  ))}
+                  <option value="Standard">Standard (1 Loop - Faster & Cheaper)</option>
+                  <option value="Maximize">Maximize (Up to 3 Loops - Highest Quality)</option>
                 </select>
-              )}
+              </div>
+            </div>
+
+            <div className="space-y-2 border-t pt-4">
+              <Label htmlFor="directors-note" className="flex items-center text-indigo-700">
+                <span className="font-bold">Director's Note</span>
+                <span className="ml-2 text-xs font-normal text-gray-500">(Optional Runtime Briefing)</span>
+              </Label>
+              <textarea 
+                id="directors-note"
+                className="w-full min-h-[80px] p-2 border border-indigo-200 bg-indigo-50/30 rounded-md text-sm placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                placeholder="e.g. 'Make sure the title mentions Elon Musk', 'Focus heavily on the urgency of AI', 'Do not use clickbait words like SHOCKING'"
+                value={directorsNote}
+                onChange={(e) => setDirectorsNote(e.target.value)}
+              />
+              <p className="text-xs text-gray-500 leading-tight">
+                This note will be injected directly into the minds of the Analyst, SEO, Visuals, and Copywriter agents to dynamically steer their strategy for this specific video.
+              </p>
             </div>
 
           </CardContent>

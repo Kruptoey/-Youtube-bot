@@ -1,6 +1,7 @@
 import { inngest } from "./client";
 import { supabaseAdmin as supabase } from "@/lib/supabase-admin";
 import { google } from "googleapis";
+import { Readable } from "stream";
 
 export const updateYoutubeVideo = inngest.createFunction(
   {
@@ -36,11 +37,12 @@ export const updateYoutubeVideo = inngest.createFunction(
     const { video, auth } = await step.run("fetch-data", async () => {
       const { data: videoData } = await supabase.from("videos").select("*").eq("id", videoId).single();
       const { data: authData } = await supabase.from("channel_settings").select("*").limit(1).single();
-      
+
+      if (!videoData) throw new Error(`Video record ${videoId} not found in database`);
       if (!authData || !authData.refresh_token) {
         throw new Error("No YouTube OAuth refresh_token found in channel_settings");
       }
-      
+
       return { video: videoData, auth: authData };
     });
 
@@ -73,8 +75,8 @@ export const updateYoutubeVideo = inngest.createFunction(
           id: video.video_id,
           snippet: {
             ...currentSnippet, // Preserve categoryId etc.
-            title: video.generated_title.substring(0, 100), // Max 100 chars
-            description: video.generated_description.substring(0, 5000), // Max 5000 chars
+            title: (video.generated_title ?? "").substring(0, 100),
+            description: (video.generated_description ?? "").substring(0, 5000),
             tags: tagsArray
           }
         }
@@ -105,7 +107,7 @@ export const updateYoutubeVideo = inngest.createFunction(
         videoId: video.video_id,
         media: {
           mimeType: "image/png", // /api/og returns PNG
-          body: require("stream").Readable.from(imageBuffer)
+          body: Readable.from(imageBuffer)
         }
       });
     });

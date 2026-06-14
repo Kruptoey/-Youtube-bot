@@ -4,7 +4,7 @@ import { supabaseAdmin as supabase } from "@/lib/supabase-admin";
 
 export async function POST(req: Request) {
   try {
-    const { youtubeUrl, personaId } = await req.json();
+    const { youtubeUrl, personaId, qualityMode, directorsNote } = await req.json();
 
     if (!youtubeUrl) {
       return NextResponse.json({ error: "YouTube URL is required" }, { status: 400 });
@@ -50,7 +50,9 @@ export async function POST(req: Request) {
       data: {
         videoId: dbRecordId,
         youtubeUrl: youtubeUrl,
-        personaId: personaId
+        personaId: personaId,
+        qualityMode: qualityMode || "Standard",
+        directorsNote: directorsNote || ""
       }
     });
 

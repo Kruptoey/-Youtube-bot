@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import { LogOut, LayoutDashboard, Settings, History } from "lucide-react";
+import { LogOut, LayoutDashboard, Settings, History, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
 export default function DashboardLayout({
@@ -47,6 +47,12 @@ export default function DashboardLayout({
                 History
               </Button>
             </Link>
+            <Link href="/dashboard/agents">
+              <Button variant="ghost" className="w-full justify-start">
+                <Users className="w-4 h-4 mr-2" />
+                AI Team
+              </Button>
+            </Link>
             <Link href="/dashboard/settings">
               <Button variant="ghost" className="w-full justify-start">
                 <Settings className="w-4 h-4 mr-2" />
@@ -56,10 +62,30 @@ export default function DashboardLayout({
           </nav>
         </aside>
 
-        <main className="flex-1 p-6 md:p-8">
+        <main className="flex-1 p-6 md:p-8 pb-20 md:pb-8">
           {children}
         </main>
       </div>
+
+      {/* Mobile bottom navigation — visible only on narrow screens */}
+      <nav className="fixed bottom-0 left-0 right-0 z-10 flex md:hidden bg-white border-t border-gray-200 dark:bg-gray-800 dark:border-gray-700">
+        <Link href="/dashboard" className="flex flex-1 flex-col items-center py-3 text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white gap-1">
+          <LayoutDashboard className="w-5 h-5" />
+          New
+        </Link>
+        <Link href="/dashboard/history" className="flex flex-1 flex-col items-center py-3 text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white gap-1">
+          <History className="w-5 h-5" />
+          History
+        </Link>
+        <Link href="/dashboard/agents" className="flex flex-1 flex-col items-center py-3 text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white gap-1">
+          <Users className="w-5 h-5" />
+          AI Team
+        </Link>
+        <Link href="/dashboard/settings" className="flex flex-1 flex-col items-center py-3 text-xs text-gray-500 hover:text-gray-900 dark:hover:text-white gap-1">
+          <Settings className="w-5 h-5" />
+          Settings
+        </Link>
+      </nav>
     </div>
   );
 }

@@ -35,151 +35,211 @@ export const processVideoFunction = inngest.createFunction(
     },
   },
   async ({ event, step }) => {
-    const { videoId, youtubeUrl, personaId } = event.data;
-
-    // Fetch existing video record
-    const { data: videoData } = await supabase.from("videos").select("*").eq("id", videoId).single();
-    if (!videoData) throw new Error("Video not found");
-
-    let transcript = videoData.transcript;
+    const { videoId, youtubeUrl, personaId, qualityMode, directorsNote } = event.data;
 
     // ==========================================
-    // PHASE A: TRANSCRIPTION ("The Ears")
+    // PHASE A: TRANSCRIPTION (Google Gemini 1.5 Flash)
     // ==========================================
-    if (!transcript) {
-      await step.run("update-state-extracting", async () => {
-        await supabase.from("videos").update({ status: "EXTRACTING_AUDIO" }).eq("id", videoId);
-      });
+    await step.run("update-state-extracting", async () => {
+      await supabase.from("videos").update({ status: "EXTRACTING_AUDIO" }).eq("id", videoId);
+    });
 
-      const audioFilePath = await step.run("extract-audio", async () => {
-        const tempDir = os.tmpdir();
-        const filename = `audio-${videoId}-${Date.now()}.mp3`;
-        const filePath = path.join(tempDir, filename);
-        
-        try {
-           await youtubedl(youtubeUrl, {
-             extractAudio: true,
-             audioFormat: "mp3",
-             output: filePath,
-             noCheckCertificates: true,
-             noWarnings: true,
-             addHeader: ["referer:youtube.com", "user-agent:Mozilla/5.0"]
-           });
-           return filePath;
-        } catch (err: any) {
-           throw new Error(`Failed to download audio: ${err.message}`);
-        }
-      });
+    const transcript = await step.run("extract-and-transcribe", async () => {
+      if (!process.env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set.");
 
-      // Transcribe using Gemini 1.5 Flash (Cheapest & Fastest)
-      transcript = await step.run("transcribe-audio", async () => {
-        if (!process.env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is missing");
-        
+      const audioPath = path.join(os.tmpdir(), `${videoId}.mp3`);
+
+      try {
+        await youtubedl(youtubeUrl, {
+          extractAudio: true,
+          audioFormat: "mp3",
+          output: audioPath,
+          noCheckCertificates: true,
+          noWarnings: true,
+          addHeader: ["referer:youtube.com", "user-agent:googlebot"],
+        });
+
+        const audioBase64 = fs.readFileSync(audioPath).toString("base64");
+
         const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        
-        const audioBuffer = fs.readFileSync(audioFilePath);
-        
-        const result = await model.generateContent([
-          "Transcribe this audio precisely. Output only the transcription text, nothing else.",
-          {
-            inlineData: {
-              mimeType: "audio/mp3",
-              data: audioBuffer.toString("base64")
-            }
-          }
-        ]);
-        
-        const text = result.response.text();
-        
-        // Save transcript to DB
-        await supabase.from("videos").update({ transcript: text }).eq("id", videoId);
-        
-        // Cleanup file
-        try { fs.unlinkSync(audioFilePath); } catch (e) {}
 
-        return text;
-      });
-    }
+        const result = await model.generateContent([
+          { inlineData: { mimeType: "audio/mp3", data: audioBase64 } },
+          { text: "Please transcribe this audio completely and accurately. Return only the transcript text, no timestamps or extra formatting." },
+        ]);
+
+        const transcriptText = result.response.text();
+
+        await supabase.from("videos").update({ transcript: transcriptText }).eq("id", videoId);
+
+        return transcriptText;
+      } finally {
+        if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+      }
+    });
 
     // ==========================================
-    // PHASE B: GENERATION ("The Brain")
+    // PHASE B: GENERATION (The 6-Agent Virtual Agency)
     // ==========================================
     await step.run("update-state-analyzing", async () => {
       await supabase.from("videos").update({ status: "AI_ANALYZING" }).eq("id", videoId);
     });
 
-    const aiResult = await step.run("ai-analyze-multi-provider", async () => {
-      // 1. Fetch Persona
-      let persona = null;
+    const aiResult = await step.run("ai-analyze-multi-agent", async () => {
+      if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing for the Multi-Agent Pipeline.");
+      const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const fastModel = openai("gpt-4o-mini");
+      const smartModel = openai("gpt-4o");
+
+      // 1. Fetch User Persona (The Creative Director)
+      let creativeDirector = { system_prompt: "You are a master YouTube strategist aiming for high CTR and viral reach." };
       if (personaId) {
         const { data } = await supabase.from("ai_personas").select("*").eq("id", personaId).single();
-        persona = data;
-      }
-      
-      // Fallback if no persona or deleted
-      if (!persona) {
-        persona = {
-          provider: "google",
-          model: "gemini-1.5-pro",
-          system_prompt: "You are an expert YouTube SEO specialist. Analyze this transcript and generate metadata."
-        };
+        if (data) creativeDirector = data;
       }
 
-      // 2. Initialize Vercel AI SDK Provider
-      let aiModel;
-      
-      if (persona.provider === "openai") {
-        if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing in environment variables.");
-        const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        aiModel = openai(persona.model); // e.g. 'gpt-4o'
-      } 
-      else if (persona.provider === "anthropic") {
-        if (!process.env.ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY is missing in environment variables.");
-        const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        aiModel = anthropic(persona.model); // e.g. 'claude-3-5-sonnet-20240620'
-      } 
-      else { // default google
-        if (!process.env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is missing in environment variables.");
-        const googleAI = createGoogleGenerativeAI({ apiKey: process.env.GEMINI_API_KEY });
-        aiModel = googleAI(persona.model); // e.g. 'gemini-1.5-pro'
-      }
+      // Director's Note Injection
+      const briefingInjection = directorsNote 
+        ? `\n\nCRITICAL DIRECTOR's NOTE FOR THIS SPECIFIC VIDEO:\n"""\n${directorsNote}\n"""\nYou MUST adhere to this note above all other general instructions.`
+        : "";
 
-      // 3. Define Zod Schema for Structured Output
-      const seoSchema = z.object({
-        title: z.string().describe("SEO optimized YouTube title (under 100 chars)"),
-        description: z.string().describe("Detailed YouTube description with timestamps and hashtags"),
-        tags: z.string().describe("Comma separated tags for YouTube"),
-        thumbnailText: z.string().describe("2-4 words maximum, extremely catchy text for the thumbnail")
+      // 2. Fetch Operational System Agents
+      const { data: systemAgents } = await supabase.from("ai_personas").select("*").like("name", "System - %");
+      
+      const getSysPrompt = (name: string, defaultPrompt: string) => {
+        const agent = systemAgents?.find(a => a.name === name);
+        return (agent ? agent.system_prompt : defaultPrompt) + briefingInjection;
+      };
+
+      const analystPrompt = getSysPrompt("System - Analyst", "You are an elite Data & Audience Analyst. Extract the psychographic profile and core value proposition.");
+      const seoPrompt = getSysPrompt("System - SEO", "You are a YouTube SEO Director. Write the perfect SEO description and tags.");
+      const visualPrompt = getSysPrompt("System - Visuals", "You are a YouTube Art Director. Generate 3 extremely punchy thumbnail text options (2-4 words max) that create synergy and curiosity.");
+
+      // ------------------------------------------
+      // AGENT 1: The Analyst (Audience & Core Value)
+      // ------------------------------------------
+      const { object: analystOutput } = await generateObject({
+        model: fastModel,
+        schema: z.object({
+          core_value: z.string().describe("The primary 'Aha!' moment or core lesson of the video."),
+          target_audience: z.string().describe("Detailed psychographic profile of who would watch this."),
+          pain_points: z.array(z.string()).describe("List of pain points this video solves for the audience.")
+        }),
+        prompt: `System: ${analystPrompt}\n\nTranscript: \n\n${transcript.substring(0, 15000)}`,
       });
 
-      // 4. Generate Object (Robust, works across all models)
-      const promptText = `
-        System Rules:
-        ${persona.system_prompt}
-        
-        Video Transcript:
-        """
-        ${transcript}
-        """
-        
-        Please provide the optimized metadata for this video based strictly on the transcript provided.
-      `;
+      // ------------------------------------------
+      // PARALLEL EXECUTION: SEO & Visual Hook
+      // ------------------------------------------
+      const [seoOutput, visualOutput] = await Promise.all([
+        // AGENT 2: SEO Director
+        generateObject({
+          model: fastModel,
+          schema: z.object({
+            description: z.string().describe("A highly optimized 3-paragraph YouTube description focusing on the first 150 characters."),
+            tags: z.array(z.string()).describe("15-20 high-volume, low-competition tags, specific to the topic.")
+          }),
+          prompt: `System: ${seoPrompt}\nAudience: ${JSON.stringify(analystOutput)}\nTranscript: ${transcript.substring(0, 5000)}`
+        }),
 
-      try {
-        const { object } = await generateObject({
-          model: aiModel,
-          schema: seoSchema,
-          prompt: promptText,
-          maxOutputTokens: 2000,
-          temperature: 0.7,
+        // AGENT 4: Visual Hook Designer
+        generateObject({
+          model: smartModel,
+          schema: z.object({
+            thumbnail_text_options: z.array(z.string()).describe("3 punchy, emotional, 2-3 word texts for the thumbnail.")
+          }),
+          prompt: `System: ${visualPrompt}\nAudience: ${JSON.stringify(analystOutput)}\nTranscript: ${transcript.substring(0, 3000)}`
+        })
+      ]);
+
+      // ------------------------------------------
+      // THE REFLECTION LOOP (Agents 3 & 5)
+      // ------------------------------------------
+      const maxLoops = qualityMode === "Maximize" ? 3 : 1;
+      let currentLoop = 1;
+      let finalWinner = null;
+      let previousCritique = "No previous attempts.";
+
+      while (currentLoop <= maxLoops) {
+        // AGENT 3: Master Copywriter
+        const { object: copywriterOutput } = await generateObject({
+          model: smartModel,
+          schema: z.object({
+            fomo_title: z.string().describe("Title inducing Fear of Missing Out"),
+            contrarian_title: z.string().describe("Title that goes against common beliefs"),
+            secret_title: z.string().describe("Title focusing on a revealed secret"),
+            transformation_title: z.string().describe("Title promising the ultimate transformation")
+          }),
+          prompt: `System: ${creativeDirector.system_prompt}${briefingInjection}\n
+            You are drafting viral titles for this audience: ${JSON.stringify(analystOutput)}
+            Previous Feedback (if any): ${previousCritique}
+            Transcript summary: ${transcript.substring(0, 3000)}
+            Create 4 unique titles under 60 chars.`
         });
-        
-        return object;
-      } catch (e: any) {
-        console.error("AI Generation failed:", e);
-        throw new Error(`AI Provider [${persona.provider}] failed: ${e.message}`);
+
+        // AGENT 5: Red Team Critic
+        const { object: criticOutput } = await generateObject({
+          model: smartModel,
+          schema: z.object({
+            score: z.number().min(1).max(10).describe("Rate the best title from 1 to 10 based on CTR potential."),
+            winning_title: z.string().describe("The absolute best title chosen from the 4 options, refined if necessary."),
+            winning_thumbnail_text: z.string().describe("The best 2-3 word thumbnail text from options that perfectly complements the winning title."),
+            critique: z.string().describe("If score is < 8, explain WHY it fails and what the copywriter must change.")
+          }),
+          prompt: `System: ${creativeDirector.system_prompt}${briefingInjection}\n
+            You are the Executive Critic. Your standard for an 8/10 is absolute perfection, immense curiosity gap, and ZERO boring academic tone.
+            Review these titles: ${JSON.stringify(copywriterOutput)}
+            Review these thumbnail text options: ${JSON.stringify(visualOutput.object.thumbnail_text_options)}
+            Select the best combination. If it doesn't give you goosebumps, give it a score lower than 8 and provide a harsh critique.`
+        });
+
+        if (criticOutput.score >= 8 || currentLoop === maxLoops) {
+          finalWinner = criticOutput;
+          break; // Loop satisfied!
+        } else {
+          previousCritique = criticOutput.critique;
+          currentLoop++;
+        }
       }
+
+      // ------------------------------------------
+      // POST-PROCESSING: Social Media Squad
+      // ------------------------------------------
+      let finalDescription = seoOutput.object.description;
+      
+      const { data: socialAgents } = await supabase.from("ai_personas").select("*").like("name", "Social - %");
+      
+      if (socialAgents && socialAgents.length > 0) {
+        const socialPromises = socialAgents.map(async (agent) => {
+          const { object: socialOutput } = await generateObject({
+            model: fastModel,
+            schema: z.object({
+              content: z.string().describe("The generated social media content formatted perfectly for the platform.")
+            }),
+            prompt: `System: ${agent.system_prompt}${briefingInjection}\n
+              You are part of the Social Media Squad. 
+              Create a post for this platform based on this YouTube video.
+              Winning Title: ${finalWinner!.winning_title}
+              Audience: ${JSON.stringify(analystOutput)}
+              Transcript: ${transcript.substring(0, 3000)}`
+          });
+          return `\n\n---\n🔥 **${agent.name.replace("Social - ", "")}**\n\n${socialOutput.content}`;
+        });
+
+        const socialResults = await Promise.all(socialPromises);
+        finalDescription += "\n\n=========================================\n📲 SOCIAL MEDIA SQUAD CONTENT\n=========================================" + socialResults.join("");
+      }
+
+      // ------------------------------------------
+      // AGENT 6: Data Architect (Final Formatting)
+      // ------------------------------------------
+      return {
+        title: finalWinner!.winning_title,
+        description: finalDescription,
+        tags: seoOutput.object.tags.join(", "),
+        thumbnailText: finalWinner!.winning_thumbnail_text
+      };
     });
 
     // Step 6: Save results & update status
