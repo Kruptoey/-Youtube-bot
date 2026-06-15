@@ -8,7 +8,7 @@ export async function POST(req: NextRequest) {
   if (unauthorized) return unauthorized;
 
   try {
-    const { youtubeUrl, personaId, qualityMode, directorsNote } = await req.json();
+    const { youtubeUrl, personaId, qualityMode, directorsNote, thumbnailRefUrl } = await req.json();
 
     if (!youtubeUrl) {
       return NextResponse.json({ error: "YouTube URL is required" }, { status: 400 });
@@ -31,11 +31,11 @@ export async function POST(req: NextRequest) {
     const { data, error } = await supabase
       .from("videos")
       .insert([
-        { 
-          youtube_url: youtubeUrl, 
+        {
+          youtube_url: youtubeUrl,
           video_id: videoId,
           persona_id: personaId || null,
-          status: "DRAFT" 
+          status: "DRAFT"
         }
       ])
       .select()
@@ -48,6 +48,20 @@ export async function POST(req: NextRequest) {
 
     const dbRecordId = data.id;
 
+    // Persist the optional reference image so a later "Regenerate" remembers it.
+    // Best-effort: the column only exists after the thumbnail migration is applied,
+    // so a failure here must NOT block starting the job (the worker also gets the ref
+    // via the event payload below).
+    if (thumbnailRefUrl) {
+      const { error: refError } = await supabase
+        .from("videos")
+        .update({ thumbnail_ref_url: thumbnailRefUrl })
+        .eq("id", dbRecordId);
+      if (refError) {
+        console.warn("[process-video] could not persist thumbnail_ref_url (run the thumbnail migration?):", refError.message);
+      }
+    }
+
     // Trigger Inngest Background Job
     await inngest.send({
       name: "video/process.requested",
@@ -56,7 +70,8 @@ export async function POST(req: NextRequest) {
         youtubeUrl: youtubeUrl,
         personaId: personaId,
         qualityMode: qualityMode || "Standard",
-        directorsNote: directorsNote || ""
+        directorsNote: directorsNote || "",
+        thumbnailRefUrl: thumbnailRefUrl || ""
       }
     });
 

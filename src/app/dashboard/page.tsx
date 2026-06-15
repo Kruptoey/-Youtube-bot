@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
-import { fetchPersonasAction } from "./settings/actions";
+import { fetchPersonasAction, uploadReferenceAction } from "./settings/actions";
 
 export default function DashboardPage() {
   const [url, setUrl] = useState("");
@@ -15,14 +15,40 @@ export default function DashboardPage() {
   const [personas, setPersonas] = useState<any[]>([]);
   const [selectedPersonaId, setSelectedPersonaId] = useState("");
   const [qualityMode, setQualityMode] = useState("Standard");
-  const defaultDirectorsNote = `วิดีโอนี้เป็นคลิปติวสอบระดับมหาวิทยาลัย (Academic/Tutoring) ให้ปรับ Tone & Voice ทั้งหมดเป็นแบบมืออาชีพ น่าเชื่อถือ และตรงไปตรงมา
+  const defaultDirectorsNote = `วิดีโอนี้เป็นคลิปติวสอบระดับมหาวิทยาลัยของช่อง Eazy Cal (Academic/Tutoring) โทนต้องมืออาชีพ น่าเชื่อถือ แต่มีพลังและกระตุ้นให้คลิก
 
-1. การตั้งชื่อคลิป (Title): ห้ามใช้ Clickbait หรือคำหวือหวาเด็ดขาด ให้ใช้โครงสร้างที่ชัดเจน ค้นหาง่าย เช่น [ชื่อวิชา] + [หัวข้อที่สอน] + [จุดประสงค์ เช่น ติวสอบไฟนอล/สรุปเนื้อหา] 
-2. คำอธิบาย (Description): ให้เขียนแบบสรุปเนื้อหาทางการเรียนอย่างเป็นระบบ ระบุชัดเจนว่าคลิปนี้เหมาะกับใคร (เช่น นักศึกษาวิศวะ/วิทยาศาสตร์) และสิ่งที่เด็กจะได้เรียนรู้จากคลิปนี้ 
-3. Thumbnail Text: ให้ดึง Keyword หลักของบทเรียนมาใช้แค่ 1-3 คำเท่านั้น เน้นความชัดเจนและอ่านง่ายที่สุด เช่น 'หา Curl', 'Calculus 2', 'ติวไฟนอล' ห้ามใช้ประโยคยาวๆ`;
+📝 ข้อความ (Title / Description):
+1. Title: โครงสร้างชัด ค้นหาง่าย = [ชื่อวิชา] + [หัวข้อที่สอน] + [จุดประสงค์ เช่น เฉลย Mock/ติวไฟนอล] — ไม่หลอกลวง แต่ชูความ "ออกสอบจริง" ได้
+2. Description: สรุปเนื้อหาอย่างเป็นระบบ ระบุชัดว่าเหมาะกับใคร (เช่น นศ. วิศวะ/วิทยาศาสตร์) และสิ่งที่จะได้เรียนรู้จากคลิป
+3. Thumbnail text หลัก: ดึง Keyword บทเรียนมาแค่ 1-3 คำ อ่านง่ายที่สุด เช่น 'หา Curl', 'Triple Integral', 'Calculus 1'
+
+🎨 Thumbnail visual direction (ปรับให้เข้ากับคลิปนี้):
+- ครู: สีหน้า expressive ให้เข้ากับเนื้อหา — ยิ้มกว้างชี้นิ้ว (มั่นใจ/สนุก) หรือทำหน้าตกใจ "อันนี้สำคัญ!" (จุดที่นักศึกษาพลาดบ่อย)
+- พื้นหลัง: ใส่สมการ/ไดอะแกรม "ของหัวข้อคลิปนี้จริง ๆ" แบบเรืองแสง (เช่น integral, curl, 3D coordinates) เลือกพื้นสว่างพลังงานสูง หรือมืดดราม่านีออนก็ได้ตามอารมณ์เนื้อหา
+- ตัวอักษร: headline หัวข้อชัด + เพิ่มบรรทัดล่างสีแดง/ส้มเป็น hook กระตุ้นการสอบ เช่น "ออกสอบจริง!", "โคตรออกสอบ", "เข้าใจใน 10 นาที"`;
 
   const [directorsNote, setDirectorsNote] = useState(defaultDirectorsNote);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [thumbnailRefUrl, setThumbnailRefUrl] = useState("");
+  const [uploadingRef, setUploadingRef] = useState(false);
   const router = useRouter();
+
+  const handleRefUpload = async (file: File | undefined) => {
+    if (!file) return;
+    setUploadingRef(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const res = await uploadReferenceAction(fd);
+      if (res.success && res.url) {
+        setThumbnailRefUrl(res.url);
+      } else {
+        alert("Upload failed: " + (res.error ?? "unknown error"));
+      }
+    } finally {
+      setUploadingRef(false);
+    }
+  };
 
   useEffect(() => {
     const fetchPersonas = async () => {
@@ -49,7 +75,7 @@ export default function DashboardPage() {
       const res = await fetch("/api/process-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ youtubeUrl: url, personaId: selectedPersonaId, qualityMode, directorsNote }),
+        body: JSON.stringify({ youtubeUrl: url, personaId: selectedPersonaId, qualityMode, directorsNote, thumbnailRefUrl }),
       });
       
       if (!res.ok) throw new Error("Failed to start processing");
@@ -143,6 +169,51 @@ export default function DashboardPage() {
               <p className="text-xs text-gray-500 leading-tight">
                 This note will be injected directly into the minds of the Analyst, SEO, Visuals, and Copywriter agents to dynamically steer their strategy for this specific video.
               </p>
+            </div>
+
+            {/* Advanced: optional thumbnail reference image (progressive disclosure —
+                the default pipeline needs no input; power users can steer the look). */}
+            <div className="border-t pt-4">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced((v) => !v)}
+                className="text-sm font-medium text-gray-600 hover:text-gray-900"
+              >
+                {showAdvanced ? "▾" : "▸"} Advanced — custom thumbnail look (optional)
+              </button>
+
+              {showAdvanced && (
+                <div className="mt-3 space-y-2">
+                  <Label htmlFor="thumb-ref">Reference image (style or subject)</Label>
+                  <input
+                    id="thumb-ref"
+                    type="file"
+                    accept="image/*"
+                    disabled={uploadingRef}
+                    onChange={(e) => handleRefUpload(e.target.files?.[0])}
+                    className="block w-full text-sm text-gray-600 file:mr-3 file:rounded-md file:border-0 file:bg-indigo-50 file:px-3 file:py-1.5 file:text-indigo-700"
+                  />
+                  <p className="text-xs text-gray-500 leading-tight">
+                    Optional. Upload a thumbnail style you like, or a specific photo of the
+                    presenter. The image model uses it as a reference. Leave empty to use the
+                    channel default.
+                  </p>
+                  {uploadingRef && <p className="text-xs text-indigo-600">Uploading…</p>}
+                  {thumbnailRefUrl && !uploadingRef && (
+                    <div className="flex items-center gap-2">
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={thumbnailRefUrl} alt="reference" className="h-16 w-auto rounded border" />
+                      <button
+                        type="button"
+                        onClick={() => setThumbnailRefUrl("")}
+                        className="text-xs text-red-500 hover:text-red-700"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
           </CardContent>

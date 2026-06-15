@@ -29,6 +29,7 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
   const { id } = use(params);
 
   const [loading, setLoading] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
   const [video, setVideo] = useState<any>(null);
   const [pollError, setPollError] = useState<string | null>(null);
 
@@ -61,6 +62,7 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
       //       to detect when upload finishes and status becomes COMPLETED.
       if (["COMPLETED", "FAILED", "PENDING_APPROVAL"].includes(data.status)) {
         clearPoll();
+        setRegenerating(false);
       }
     }
   }, [id, clearPoll]);
@@ -104,7 +106,30 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     }
   };
 
-  // ── Processing (DRAFT / EXTRACTING_AUDIO / AI_ANALYZING / no data yet) ──────
+  const handleRegenerate = async () => {
+    if (!video || regenerating) return;
+    setRegenerating(true);
+    try {
+      const res = await fetch(`/api/videos/${id}/regenerate-thumbnail`, { method: "POST" });
+      if (res.ok) {
+        // The worker flips status to GENERATING_THUMBNAIL → PENDING_APPROVAL; poll to
+        // pick up the freshly composited thumbnail.
+        intervalRef.current = setInterval(fetchVideo, 3000);
+      } else {
+        const errorData = await res.json().catch(() => ({}));
+        alert("Error queuing regeneration: " + (errorData.error ?? res.statusText));
+        setRegenerating(false);
+      }
+    } catch {
+      alert("Network error");
+      setRegenerating(false);
+    }
+  };
+
+  // ── Processing (DRAFT / EXTRACTING_AUDIO / AI_ANALYZING) ────────────────────────
+  // NOTE: GENERATING_THUMBNAIL is intentionally NOT here — once the text is ready we
+  // show the editable review UI immediately (perceived speed) and let the thumbnail
+  // fill in. Polling continues until PENDING_APPROVAL.
   if (!video || ["DRAFT", "EXTRACTING_AUDIO", "AI_ANALYZING"].includes(video.status)) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
@@ -160,14 +185,26 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     );
   }
 
-  // ── PENDING_APPROVAL (default) ────────────────────────────────────────────────
+  // ── PENDING_APPROVAL / GENERATING_THUMBNAIL (review UI) ─────────────────────────
+  // Text is shown immediately; while the thumbnail is still rendering we keep the
+  // review editable but gate Approve so only the finished thumbnail gets uploaded.
+  const isGeneratingThumb = video.status === "GENERATING_THUMBNAIL";
   return (
     <div className="max-w-4xl mx-auto space-y-6 pb-12">
       <div className="flex items-center justify-between">
         <h2 className="text-2xl font-bold tracking-tight">Review & Approve</h2>
-        <Button onClick={handleApprove} disabled={loading} className="bg-green-600 hover:bg-green-700">
+        <Button
+          onClick={handleApprove}
+          disabled={loading || isGeneratingThumb}
+          className="bg-green-600 hover:bg-green-700"
+        >
           {loading ? (
             "Approving..."
+          ) : isGeneratingThumb ? (
+            <>
+              <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
+              Finishing thumbnail...
+            </>
           ) : (
             <>
               <Check className="w-4 h-4 mr-2" />
@@ -179,21 +216,45 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <Card className="md:col-span-2">
-          <CardHeader>
-            <CardTitle>Generated Thumbnail Preview</CardTitle>
-            <CardDescription>Generated via Edge Satori (HTML to Image)</CardDescription>
+          <CardHeader className="flex flex-row items-start justify-between space-y-0">
+            <div>
+              <CardTitle>Generated Thumbnail Preview</CardTitle>
+              <CardDescription>
+                AI scene + deterministic Thai text.{" "}
+                {video.thumbnail_qc?.pass === false && (
+                  <span className="text-amber-600">QC flagged issues — try Regenerate.</span>
+                )}
+              </CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleRegenerate}
+              disabled={regenerating || isGeneratingThumb}
+            >
+              <RefreshCw className={`w-4 h-4 mr-2 ${regenerating || isGeneratingThumb ? "animate-spin" : ""}`} />
+              {regenerating ? "Regenerating..." : "Regenerate"}
+            </Button>
           </CardHeader>
           <CardContent>
-            <div className="relative w-full aspect-video rounded-lg overflow-hidden border border-gray-200 shadow-sm">
-              <img
-                src={`/api/og?videoId=${video.id}`}
-                alt="Thumbnail Preview"
-                className="w-full h-full object-cover"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src =
-                    "https://placehold.co/1280x720/e2e8f0/64748b?text=Preview+Loading...";
-                }}
-              />
+            <div className="relative w-full aspect-video rounded-lg overflow-hidden border border-gray-200 shadow-sm bg-gray-100">
+              {isGeneratingThumb ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-gray-500">
+                  <RefreshCw className="w-10 h-10 animate-spin text-primary" />
+                  <p className="text-sm font-medium">Designing your thumbnail…</p>
+                  <p className="text-xs">Art Director is composing the scene; QC checks it before you see it.</p>
+                </div>
+              ) : (
+                <img
+                  src={video.generated_thumbnail_url || `/api/og?videoId=${video.id}`}
+                  alt="Thumbnail Preview"
+                  className="w-full h-full object-cover"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).src =
+                      "https://placehold.co/1280x720/e2e8f0/64748b?text=Preview+Loading...";
+                  }}
+                />
+              )}
             </div>
           </CardContent>
         </Card>

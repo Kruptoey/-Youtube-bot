@@ -17,6 +17,9 @@ import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 
+// AI thumbnail pipeline (Art Director → scene → composite → QC). Degrades gracefully.
+import { produceThumbnail } from "@/lib/thumbnail";
+
 type CaptionTrack = { ext: string; url: string; name?: string };
 
 /**
@@ -253,7 +256,7 @@ export const processVideoFunction = inngest.createFunction(
     },
   },
   async ({ event, step }) => {
-    const { videoId, youtubeUrl, personaId, qualityMode, directorsNote } = event.data;
+    const { videoId, youtubeUrl, personaId, qualityMode, directorsNote, thumbnailRefUrl } = event.data;
 
     // ==========================================
     // PHASE A: TRANSCRIPTION (Google Gemini 1.5 Flash)
@@ -337,12 +340,30 @@ export const processVideoFunction = inngest.createFunction(
       await supabase.from("videos").update({ status: "AI_ANALYZING" }).eq("id", videoId);
     });
 
-    const aiResult = await step.run("ai-analyze-multi-agent", async () => {
+    const aiResult = await step.run("ai-analyze-mega-pipeline", async () => {
       const phaseBStart = Date.now();
-      if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is not set in .env.local — required for the Multi-Agent Pipeline. Add it and restart the dev server.");
-      const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-      const fastModel = openai("gpt-4o-mini");
-      const smartModel = openai("gpt-4o");
+      
+      // Brain models. Anthropic is preferred for structured copywriting; OpenAI is the
+      // fallback. Model IDs are env-overridable so a retired alias never bricks the
+      // pipeline again (the old "claude-3-5-sonnet-latest" default did exactly that).
+      // Defaults are the current, faster-and-smarter generation.
+      const hasAnthropic = !!process.env.ANTHROPIC_API_KEY;
+      const hasOpenAI = !!process.env.OPENAI_API_KEY;
+
+      if (!hasAnthropic && !hasOpenAI) {
+        throw new Error("Missing AI API Key. Please set ANTHROPIC_API_KEY (recommended) or OPENAI_API_KEY in .env.local");
+      }
+
+      let megaModel, fastModel;
+      if (hasAnthropic) {
+        const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+        megaModel = anthropic(process.env.ANTHROPIC_MEGA_MODEL || "claude-sonnet-4-6");
+        fastModel = anthropic(process.env.ANTHROPIC_FAST_MODEL || "claude-haiku-4-5-20251001");
+      } else {
+        const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+        megaModel = openai(process.env.OPENAI_MEGA_MODEL || "gpt-4o");
+        fastModel = openai(process.env.OPENAI_FAST_MODEL || "gpt-4o-mini");
+      }
 
       // 1. Fetch User Persona (The Creative Director)
       let creativeDirector = { system_prompt: "You are a master YouTube strategist aiming for high CTR and viral reach." };
@@ -353,117 +374,53 @@ export const processVideoFunction = inngest.createFunction(
 
       // Director's Note Injection
       const briefingInjection = directorsNote 
-        ? `\n\nCRITICAL DIRECTOR's NOTE FOR THIS SPECIFIC VIDEO:\n"""\n${directorsNote}\n"""\nYou MUST adhere to this note above all other general instructions.`
+        ? `\n\nCRITICAL DIRECTOR'S NOTE FOR THIS SPECIFIC VIDEO:\n"""\n${directorsNote}\n"""\nYou MUST adhere to this note above all other general instructions.`
         : "";
 
-      // 2. Fetch Operational System Agents
-      const { data: systemAgents } = await supabase.from("ai_personas").select("*").like("name", "System - %");
-      
-      const getSysPrompt = (name: string, defaultPrompt: string) => {
-        const agent = systemAgents?.find(a => a.name === name);
-        return (agent ? agent.system_prompt : defaultPrompt) + briefingInjection;
-      };
-
-      const analystPrompt = getSysPrompt("System - Analyst", "You are an elite Data & Audience Analyst. Extract the psychographic profile and core value proposition.");
-      const seoPrompt = getSysPrompt("System - SEO", "You are a YouTube SEO Director. Write the perfect SEO description and tags.");
-      const visualPrompt = getSysPrompt("System - Visuals", "You are a YouTube Art Director. Generate 3 extremely punchy thumbnail text options (2-4 words max) that create synergy and curiosity.");
-
       // ------------------------------------------
-      // AGENT 1: The Analyst (Audience & Core Value)
+      // HOP 1: MASTER STRATEGIST + EXECUTIVE JUDGE (SINGLE MEGA-CALL)
       // ------------------------------------------
-      const { object: analystOutput } = await timedGen("analyst", generateObject({
-        model: fastModel,
+      // Analyst, SEO, visual hooks, Best-of-N titles AND the winner selection are all
+      // produced in ONE structured call. Merging the old separate "judge" round-trip
+      // saves a full model latency while improving quality: the model picks the winner
+      // with the full audience + every candidate in one coherent reasoning context.
+      const { object: megaOutput } = await timedGen("mega-call", generateObject({
+        model: megaModel,
         schema: z.object({
-          core_value: z.string().describe("The primary 'Aha!' moment or core lesson of the video."),
-          target_audience: z.string().describe("Detailed psychographic profile of who would watch this."),
-          pain_points: z.array(z.string()).describe("List of pain points this video solves for the audience.")
-        }),
-        prompt: `System: ${analystPrompt}\n\nTranscript: \n\n${transcript.substring(0, 15000)}`,
-      }));
-
-      // ------------------------------------------
-      // PARALLEL EXECUTION: SEO & Visual Hook
-      // ------------------------------------------
-      const parallelStart = Date.now();
-      const [seoOutput, visualOutput] = await Promise.all([
-        // AGENT 2: SEO Director
-        timedGen("seo", generateObject({
-          model: fastModel,
-          schema: z.object({
+          analyst: z.object({
+            core_value: z.string().describe("The primary 'Aha!' moment or core lesson of the video."),
+            target_audience: z.string().describe("Detailed psychographic profile of who would watch this."),
+            pain_points: z.array(z.string()).describe("List of pain points this video solves for the audience.")
+          }),
+          seo: z.object({
             description: z.string().describe("A highly optimized 3-paragraph YouTube description focusing on the first 150 characters."),
             tags: z.array(z.string()).describe("15-20 high-volume, low-competition tags, specific to the topic.")
           }),
-          prompt: `System: ${seoPrompt}\nAudience: ${JSON.stringify(analystOutput)}\nTranscript: ${transcript.substring(0, 5000)}`
-        })),
+          visual_hooks: z.array(z.string()).min(3).describe("3 punchy, emotional, 2-4 word texts for the thumbnail."),
+          best_of_n_titles: z.array(z.object({
+            style: z.string().describe("Psychological angle (e.g., FOMO, Contrarian, Curiosity, Story, Secret)."),
+            title: z.string().describe("The actual title, under 60 characters, highly viral.")
+          })).min(6).max(7).describe("Generate 6-7 DISTINCT, highly viral titles (no near-duplicates)."),
+          winning_title: z.string().describe("Acting as a ruthless Red Team critic, the single best title from your options — refine it for maximum CTR and curiosity gap, zero boring tone."),
+          winning_thumbnail_text: z.string().describe("The thumbnail text (from visual_hooks, refined) that best complements the winning title."),
+          selection_reasoning: z.string().describe("One sentence on why this title+thumbnail combo has the highest CTR potential.")
+        }),
+        prompt: `System: ${creativeDirector.system_prompt}${briefingInjection}\n
+          You are an elite Master Strategist AND your own Red Team critic.
+          Step 1 — analyze the transcript and produce the audience profile, SEO, visual hooks, and 6-7 distinct viral titles.
+          Step 2 — critique your own options and SELECT the single best title + matching thumbnail text, refining them for maximum CTR.
+          Ensure absolute synergy between audience, SEO, hooks, titles, and the final winner.
 
-        // AGENT 4: Visual Hook Designer
-        timedGen("visual", generateObject({
-          model: smartModel,
-          schema: z.object({
-            thumbnail_text_options: z.array(z.string()).describe("3 punchy, emotional, 2-3 word texts for the thumbnail.")
-          }),
-          prompt: `System: ${visualPrompt}\nAudience: ${JSON.stringify(analystOutput)}\nTranscript: ${transcript.substring(0, 3000)}`
-        }))
-      ]);
-      plog(`seo‖visual block ${String(Date.now() - parallelStart).padStart(6)}ms (wall-clock of the parallel pair)`);
+          Transcript:
+          ${transcript.substring(0, 12000)}`
+      }));
 
-      // ------------------------------------------
-      // THE REFLECTION LOOP (Agents 3 & 5)
-      // ------------------------------------------
-      const maxLoops = qualityMode === "Maximize" ? 3 : 1;
-      let currentLoop = 1;
-      let finalWinner = null;
-      let previousCritique = "No previous attempts.";
-
-      while (currentLoop <= maxLoops) {
-        // AGENT 3: Master Copywriter
-        const { object: copywriterOutput } = await timedGen(`copywriter#${currentLoop}`, generateObject({
-          model: smartModel,
-          schema: z.object({
-            fomo_title: z.string().describe("Title inducing Fear of Missing Out"),
-            contrarian_title: z.string().describe("Title that goes against common beliefs"),
-            secret_title: z.string().describe("Title focusing on a revealed secret"),
-            transformation_title: z.string().describe("Title promising the ultimate transformation")
-          }),
-          prompt: `System: ${creativeDirector.system_prompt}${briefingInjection}\n
-            You are drafting viral titles for this audience: ${JSON.stringify(analystOutput)}
-            Previous Feedback (if any): ${previousCritique}
-            Transcript summary: ${transcript.substring(0, 3000)}
-            Create 4 unique titles under 60 chars.`
-        }));
-
-        // AGENT 5: Red Team Critic
-        const { object: criticOutput } = await timedGen(`critic#${currentLoop}`, generateObject({
-          model: smartModel,
-          schema: z.object({
-            score: z.number().min(1).max(10).describe("Rate the best title from 1 to 10 based on CTR potential."),
-            winning_title: z.string().describe("The absolute best title chosen from the 4 options, refined if necessary."),
-            winning_thumbnail_text: z.string().describe("The best 2-3 word thumbnail text from options that perfectly complements the winning title."),
-            critique: z.string().describe("If score is < 8, explain WHY it fails and what the copywriter must change.")
-          }),
-          prompt: `System: ${creativeDirector.system_prompt}${briefingInjection}\n
-            You are the Executive Critic. Your standard for an 8/10 is absolute perfection, immense curiosity gap, and ZERO boring academic tone.
-            Review these titles: ${JSON.stringify(copywriterOutput)}
-            Review these thumbnail text options: ${JSON.stringify(visualOutput.object.thumbnail_text_options)}
-            Select the best combination. If it doesn't give you goosebumps, give it a score lower than 8 and provide a harsh critique.`
-        }));
-
-        plog(`loop ${currentLoop}/${maxLoops} → critic score ${criticOutput.score}`);
-
-        if (criticOutput.score >= 8 || currentLoop === maxLoops) {
-          finalWinner = criticOutput;
-          break; // Loop satisfied!
-        } else {
-          previousCritique = criticOutput.critique;
-          currentLoop++;
-        }
-      }
+      plog(`Mega-Call (+judge) completed. Winner: ${megaOutput.winning_title}`);
 
       // ------------------------------------------
-      // POST-PROCESSING: Social Media Squad
+      // HOP 2 (PARALLEL): SOCIAL MEDIA SQUAD
       // ------------------------------------------
-      let finalDescription = seoOutput.object.description;
-      
+      let finalDescription = megaOutput.seo.description;
       const { data: socialAgents } = await supabase.from("ai_personas").select("*").like("name", "Social - %");
       
       if (socialAgents && socialAgents.length > 0) {
@@ -475,11 +432,11 @@ export const processVideoFunction = inngest.createFunction(
               content: z.string().describe("The generated social media content formatted perfectly for the platform.")
             }),
             prompt: `System: ${agent.system_prompt}${briefingInjection}\n
-              You are part of the Social Media Squad.
-              Create a post for this platform based on this YouTube video.
-              Winning Title: ${finalWinner!.winning_title}
-              Audience: ${JSON.stringify(analystOutput)}
-              Transcript: ${transcript.substring(0, 3000)}`
+              You are part of the Social Media Squad. Create a highly engaging post based on this winning angle.
+              Winning Title: ${megaOutput.winning_title}
+              Audience: ${JSON.stringify(megaOutput.analyst)}
+              Core Value: ${megaOutput.analyst.core_value}
+              Note: Do not need to read the full transcript, just adapt the core value to fit the platform style.`
           }));
           return `\n\n---\n🔥 **${agent.name.replace("Social - ", "")}**\n\n${socialOutput.content}`;
         });
@@ -489,19 +446,19 @@ export const processVideoFunction = inngest.createFunction(
         finalDescription += "\n\n=========================================\n📲 SOCIAL MEDIA SQUAD CONTENT\n=========================================" + socialResults.join("");
       }
 
-      // ------------------------------------------
-      // AGENT 6: Data Architect (Final Formatting)
-      // ------------------------------------------
       plog(`TOTAL Phase B ${String(Date.now() - phaseBStart).padStart(6)}ms`);
       return {
-        title: finalWinner!.winning_title,
+        title: megaOutput.winning_title,
         description: finalDescription,
-        tags: seoOutput.object.tags.join(", "),
-        thumbnailText: finalWinner!.winning_thumbnail_text
+        tags: megaOutput.seo.tags.join(", "),
+        thumbnailText: megaOutput.winning_thumbnail_text,
+        analyst: megaOutput.analyst
       };
     });
 
-    // Step 6: Save results & update status
+    // Step 6: Save text results. Status → GENERATING_THUMBNAIL so the preview keeps
+    // polling while the (slower) image pipeline runs; we flip to PENDING_APPROVAL once
+    // the thumbnail is ready.
     await step.run("save-results", async () => {
       await supabase
         .from("videos")
@@ -510,9 +467,36 @@ export const processVideoFunction = inngest.createFunction(
           generated_description: aiResult.description,
           generated_tags: aiResult.tags?.split(",").map((t: string) => t.trim()),
           generated_thumbnail_text: aiResult.thumbnailText,
-          status: "PENDING_APPROVAL"
+          status: "GENERATING_THUMBNAIL"
         })
         .eq("id", videoId);
+    });
+
+    // Step 7: AI thumbnail (Art Director → scene → composite → QC). NON-FATAL — any
+    // failure leaves the scene/brief unset and /api/og falls back to the legacy
+    // template, so the user always gets a usable thumbnail and the pipeline never
+    // dies over a thumbnail.
+    await step.run("generate-thumbnail", async () => {
+      try {
+        await produceThumbnail({
+          videoId,
+          transcript,
+          analyst: aiResult.analyst,
+          thumbnailText: aiResult.thumbnailText,
+          title: aiResult.title,
+          directorsNote,
+          qualityMode,
+          refUrl: thumbnailRefUrl || null,
+        });
+      } catch (e) {
+        console.error("[thumbnail] pipeline failed (non-fatal):", e);
+      }
+      return { ok: true };
+    });
+
+    // Step 8: Hand off to the user for review.
+    await step.run("finalize-pending", async () => {
+      await supabase.from("videos").update({ status: "PENDING_APPROVAL" }).eq("id", videoId);
     });
 
     return { success: true, videoId };

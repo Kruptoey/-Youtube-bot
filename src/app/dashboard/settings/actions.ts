@@ -102,6 +102,34 @@ export async function uploadAssetAction(formData: FormData, folder: string = "kr
   }
 }
 
+/**
+ * Upload an OPTIONAL per-video thumbnail reference image (a style you like, or a
+ * specific subject). Stored under thumbnails/ref/ in the assets bucket and returned
+ * as a public URL — it is transient guidance, so it is NOT registered in the assets
+ * table (keeps the Kruptoey/logo galleries clean).
+ */
+export async function uploadReferenceAction(formData: FormData) {
+  try {
+    const file = formData.get("file") as File;
+    if (!file) return { error: "No file provided" };
+
+    const fileExt = file.name.split(".").pop() || "png";
+    const fileName = `${Math.random().toString(36).substring(2, 15)}.${fileExt}`;
+    const filePath = `thumbnails/ref/${fileName}`;
+
+    const buffer = Buffer.from(await file.arrayBuffer());
+    const { error: uploadError } = await supabaseAdmin.storage
+      .from("assets")
+      .upload(filePath, buffer, { contentType: file.type });
+    if (uploadError) return { error: "Upload failed: " + uploadError.message };
+
+    const { data } = supabaseAdmin.storage.from("assets").getPublicUrl(filePath);
+    return { success: true, url: data.publicUrl };
+  } catch (err: any) {
+    return { error: err.message || "Unknown error" };
+  }
+}
+
 export async function deleteAssetAction(id: string, storagePath: string) {
   try {
     await supabaseAdmin.storage.from("assets").remove([storagePath]);
