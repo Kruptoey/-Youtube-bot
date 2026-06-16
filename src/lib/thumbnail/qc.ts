@@ -2,6 +2,7 @@ import { generateObject } from "ai";
 import { z } from "zod";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import type { ThumbnailBrief } from "./brief";
+import type { AiCost } from "@/lib/ai-cost";
 
 /**
  * QC vision verdict on the FINAL composited thumbnail. This is the mechanism that
@@ -29,7 +30,8 @@ export type QcResult = z.infer<typeof QcResultSchema>;
  */
 export async function qcThumbnail(
   pngBytes: Uint8Array,
-  brief: ThumbnailBrief
+  brief: ThumbnailBrief,
+  cost?: AiCost
 ): Promise<QcResult> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is required for thumbnail QC.");
@@ -39,7 +41,7 @@ export async function qcThumbnail(
 
   const expectedText = brief.text_layers.map((l) => l.th).join(" / ");
 
-  const { object } = await generateObject({
+  const { object, usage } = await generateObject({
     model: google(model),
     schema: QcResultSchema,
     messages: [
@@ -65,5 +67,6 @@ export async function qcThumbnail(
     ],
   });
 
+  cost?.addTokens("thumbnail:qc", model, usage);
   return object;
 }

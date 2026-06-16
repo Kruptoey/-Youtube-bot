@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import { Check, RefreshCw, UploadCloud, AlertTriangle } from "lucide-react";
+import { Check, RefreshCw, UploadCloud, AlertTriangle, Pencil } from "lucide-react";
 
 // Fetch video status via the server-side API route instead of querying Supabase
 // directly from the browser. The direct browser query relies on a valid user JWT
@@ -32,9 +32,15 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
   const [regenerating, setRegenerating] = useState(false);
   const [video, setVideo] = useState<any>(null);
   const [pollError, setPollError] = useState<string | null>(null);
+  // When true, a COMPLETED job is re-opened in the editable review UI so the user can
+  // tweak the metadata/thumbnail and re-upload it to YouTube.
+  const [editingCompleted, setEditingCompleted] = useState(false);
 
   // useRef so both useEffect and handleApprove can start/stop the same interval
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  // One-shot guard: auto-enter edit mode from ?edit=1 exactly once, so finishing a
+  // re-upload lands on the success screen instead of bouncing back into the editor.
+  const autoEnteredRef = useRef(false);
 
   const clearPoll = useCallback(() => {
     if (intervalRef.current) {
@@ -55,6 +61,9 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     setPollError(null);
     if (data) {
       setVideo(data);
+      // Once a re-upload of a completed job starts, leave edit mode so the eventual
+      // return to COMPLETED shows the success screen rather than the editor again.
+      if (data.status === "UPLOADING_TO_YOUTUBE") setEditingCompleted(false);
       // Stop the processing poll at stable states:
       // - PENDING_APPROVAL: AI is done, user is reviewing — stop to prevent overwriting edits
       // - COMPLETED / FAILED: pipeline finished — no more polling needed
@@ -72,6 +81,18 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
     intervalRef.current = setInterval(fetchVideo, 3000);
     return clearPoll; // cleanup on unmount or id change
   }, [id, fetchVideo, clearPoll]);
+
+  // Deep link from History (?edit=1) opens a completed job straight into edit mode.
+  // Read the query client-side (no useSearchParams) to avoid a Suspense requirement.
+  useEffect(() => {
+    if (autoEnteredRef.current || video?.status !== "COMPLETED") return;
+    const wantEdit = new URLSearchParams(window.location.search).get("edit") === "1";
+    if (wantEdit) {
+      autoEnteredRef.current = true;
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setEditingCompleted(true);
+    }
+  }, [video?.status]);
 
   const handleApprove = async () => {
     if (!video) return;
@@ -160,13 +181,21 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
   }
 
   // ── Complete ──────────────────────────────────────────────────────────────────
-  if (video.status === "COMPLETED") {
+  // When editingCompleted is set the user has chosen to revise this published video,
+  // so we fall through to the editable review UI below instead of the success screen.
+  if (video.status === "COMPLETED" && !editingCompleted) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh] space-y-4">
         <Check className="w-16 h-16 text-green-500" />
         <h2 className="text-3xl font-bold text-green-700">Automation Complete!</h2>
         <p className="text-gray-600 text-lg">Your video has been successfully updated on YouTube.</p>
-        <Button onClick={() => router.push("/dashboard")}>Process Another Video</Button>
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          <Button variant="outline" onClick={() => setEditingCompleted(true)}>
+            <Pencil className="w-4 h-4 mr-2" />
+            Edit &amp; re-upload
+          </Button>
+          <Button onClick={() => router.push("/dashboard")}>Process Another Video</Button>
+        </div>
       </div>
     );
   }
@@ -192,14 +221,23 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
   return (
     <div className="max-w-4xl mx-auto space-y-6 pb-12">
       <div className="flex items-center justify-between">
-        <h2 className="text-2xl font-bold tracking-tight">Review & Approve</h2>
+        <div>
+          <h2 className="text-2xl font-bold tracking-tight">
+            {editingCompleted ? "Edit & re-upload" : "Review & Approve"}
+          </h2>
+          {editingCompleted && (
+            <p className="text-sm text-amber-600">
+              This video is already published — saving will overwrite it on YouTube.
+            </p>
+          )}
+        </div>
         <Button
           onClick={handleApprove}
           disabled={loading || isGeneratingThumb}
           className="bg-green-600 hover:bg-green-700"
         >
           {loading ? (
-            "Approving..."
+            editingCompleted ? "Re-uploading..." : "Approving..."
           ) : isGeneratingThumb ? (
             <>
               <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
@@ -208,7 +246,7 @@ export default function PreviewPage({ params }: { params: Promise<{ id: string }
           ) : (
             <>
               <Check className="w-4 h-4 mr-2" />
-              Approve & Update
+              {editingCompleted ? "Re-upload to YouTube" : "Approve & Update"}
             </>
           )}
         </Button>

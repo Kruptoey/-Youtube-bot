@@ -15,10 +15,13 @@ import { generateObject } from "ai";
 import { z } from "zod";
 import { createOpenAI } from "@ai-sdk/openai";
 import { createAnthropic } from "@ai-sdk/anthropic";
-import { createGoogleGenerativeAI } from "@ai-sdk/google";
 
 // AI thumbnail pipeline (Art Director → scene → composite → QC). Degrades gracefully.
 import { produceThumbnail } from "@/lib/thumbnail";
+
+// AI cost accounting — see src/lib/ai-cost.ts. Entries are returned out of each
+// Inngest step (never carried in closure state) so replays preserve them.
+import { AiCost, type AiCostEntry } from "@/lib/ai-cost";
 
 type CaptionTrack = { ext: string; url: string; name?: string };
 
@@ -158,12 +161,25 @@ const INLINE_MAX_BYTES = 14 * 1024 * 1024;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Token usage from a Gemini native-SDK response, mapped to the common in/out shape. */
+function geminiUsage(result: { response: { usageMetadata?: { promptTokenCount?: number; candidatesTokenCount?: number } } }): {
+  inputTokens: number;
+  outputTokens: number;
+} {
+  const m = result.response.usageMetadata;
+  return { inputTokens: m?.promptTokenCount ?? 0, outputTokens: m?.candidatesTokenCount ?? 0 };
+}
+
 /**
  * Transcribe a local mp3 with Gemini, choosing the optimal transport by file size:
  *  - small files  → inline base64 (single request, lowest latency)
  *  - large files  → File API upload + reference (no 20MB limit, robust for long audio)
+ *
+ * Returns the transcript plus token usage so the caller can account for the cost.
  */
-async function transcribeWithGemini(audioPath: string): Promise<string> {
+async function transcribeWithGemini(
+  audioPath: string
+): Promise<{ text: string; model: string; usage: { inputTokens: number; outputTokens: number } }> {
   if (!process.env.GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set.");
   const apiKey = process.env.GEMINI_API_KEY;
   const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
@@ -180,7 +196,7 @@ async function transcribeWithGemini(audioPath: string): Promise<string> {
       { inlineData: { mimeType: "audio/mp3", data: audioBase64 } },
       { text: TRANSCRIPTION_PROMPT },
     ]);
-    return result.response.text();
+    return { text: result.response.text(), model: modelName, usage: geminiUsage(result) };
   }
 
   // ---- Robust path: large file, File API ----
@@ -205,7 +221,7 @@ async function transcribeWithGemini(audioPath: string): Promise<string> {
       { fileData: { mimeType: file.mimeType, fileUri: file.uri } },
       { text: TRANSCRIPTION_PROMPT },
     ]);
-    return result.response.text();
+    return { text: result.response.text(), model: modelName, usage: geminiUsage(result) };
   } finally {
     // Files auto-expire after 48h, but delete eagerly to stay tidy.
     await fileManager.deleteFile(upload.file.name).catch(() => {});
@@ -234,6 +250,20 @@ async function timedGen<T extends { usage?: { inputTokens?: number; outputTokens
     `${label.padEnd(20)} ${String(Date.now() - t0).padStart(6)}ms  in=${u.inputTokens ?? "?"} out=${u.outputTokens ?? "?"}`,
   );
   return res;
+}
+
+/**
+ * Bound a promise so a hung network/AI call can never freeze a step forever.
+ * On timeout it REJECTS (the loser fetch keeps running in the background harmlessly);
+ * the caller's try/catch then lets the pipeline proceed to PENDING_APPROVAL.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 export const processVideoFunction = inngest.createFunction(
@@ -274,6 +304,9 @@ export const processVideoFunction = inngest.createFunction(
     });
 
     let transcript: string;
+    // Cost entries are collected per step and returned as step values (Inngest-safe);
+    // they are merged and persisted in the finalize step. Captions/cache cost nothing.
+    let transcriptCostEntries: AiCostEntry[] = [];
 
     if (cachedTranscript && cachedTranscript.trim().length > 0) {
       transcript = cachedTranscript;
@@ -314,12 +347,12 @@ export const processVideoFunction = inngest.createFunction(
         });
 
         // Transcription step: self-heals via ensureAudio() if the staged file is gone.
-        transcript = await step.run("transcribe-audio", async () => {
+        const transcribed = await step.run("transcribe-audio", async () => {
           await ensureAudio(youtubeUrl, audioPath); // re-stage if file vanished between steps
 
-          const transcriptText = await transcribeWithGemini(audioPath);
+          const { text, model, usage } = await transcribeWithGemini(audioPath);
 
-          await supabase.from("videos").update({ transcript: transcriptText }).eq("id", videoId);
+          await supabase.from("videos").update({ transcript: text }).eq("id", videoId);
 
           // Clean up only on success — leaving the file on failure lets a retry reuse it.
           try {
@@ -328,8 +361,12 @@ export const processVideoFunction = inngest.createFunction(
             /* best-effort cleanup */
           }
 
-          return transcriptText;
+          const c = new AiCost();
+          c.addTokens("transcription", model, usage);
+          return { text, entries: c.entries };
         });
+        transcript = transcribed.text;
+        transcriptCostEntries = transcribed.entries;
       }
     }
 
@@ -342,7 +379,8 @@ export const processVideoFunction = inngest.createFunction(
 
     const aiResult = await step.run("ai-analyze-mega-pipeline", async () => {
       const phaseBStart = Date.now();
-      
+      const cost = new AiCost();
+
       // Brain models. Anthropic is preferred for structured copywriting; OpenAI is the
       // fallback. Model IDs are env-overridable so a retired alias never bricks the
       // pipeline again (the old "claude-3-5-sonnet-latest" default did exactly that).
@@ -355,14 +393,19 @@ export const processVideoFunction = inngest.createFunction(
       }
 
       let megaModel, fastModel;
+      let megaModelId: string, fastModelId: string;
       if (hasAnthropic) {
         const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-        megaModel = anthropic(process.env.ANTHROPIC_MEGA_MODEL || "claude-sonnet-4-6");
-        fastModel = anthropic(process.env.ANTHROPIC_FAST_MODEL || "claude-haiku-4-5-20251001");
+        megaModelId = process.env.ANTHROPIC_MEGA_MODEL || "claude-sonnet-4-6";
+        fastModelId = process.env.ANTHROPIC_FAST_MODEL || "claude-haiku-4-5-20251001";
+        megaModel = anthropic(megaModelId);
+        fastModel = anthropic(fastModelId);
       } else {
         const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        megaModel = openai(process.env.OPENAI_MEGA_MODEL || "gpt-4o");
-        fastModel = openai(process.env.OPENAI_FAST_MODEL || "gpt-4o-mini");
+        megaModelId = process.env.OPENAI_MEGA_MODEL || "gpt-4o";
+        fastModelId = process.env.OPENAI_FAST_MODEL || "gpt-4o-mini";
+        megaModel = openai(megaModelId);
+        fastModel = openai(fastModelId);
       }
 
       // 1. Fetch User Persona (The Creative Director)
@@ -384,7 +427,7 @@ export const processVideoFunction = inngest.createFunction(
       // produced in ONE structured call. Merging the old separate "judge" round-trip
       // saves a full model latency while improving quality: the model picks the winner
       // with the full audience + every candidate in one coherent reasoning context.
-      const { object: megaOutput } = await timedGen("mega-call", generateObject({
+      const megaRes = await timedGen("mega-call", generateObject({
         model: megaModel,
         schema: z.object({
           analyst: z.object({
@@ -414,6 +457,8 @@ export const processVideoFunction = inngest.createFunction(
           Transcript:
           ${transcript.substring(0, 12000)}`
       }));
+      const megaOutput = megaRes.object;
+      cost.addTokens("mega-call", megaModelId, megaRes.usage);
 
       plog(`Mega-Call (+judge) completed. Winner: ${megaOutput.winning_title}`);
 
@@ -426,7 +471,8 @@ export const processVideoFunction = inngest.createFunction(
       if (socialAgents && socialAgents.length > 0) {
         const socialStart = Date.now();
         const socialPromises = socialAgents.map(async (agent) => {
-          const { object: socialOutput } = await timedGen(`social:${agent.name.replace("Social - ", "")}`, generateObject({
+          const shortName = agent.name.replace("Social - ", "");
+          const socialRes = await timedGen(`social:${shortName}`, generateObject({
             model: fastModel,
             schema: z.object({
               content: z.string().describe("The generated social media content formatted perfectly for the platform.")
@@ -438,7 +484,8 @@ export const processVideoFunction = inngest.createFunction(
               Core Value: ${megaOutput.analyst.core_value}
               Note: Do not need to read the full transcript, just adapt the core value to fit the platform style.`
           }));
-          return `\n\n---\n🔥 **${agent.name.replace("Social - ", "")}**\n\n${socialOutput.content}`;
+          cost.addTokens(`social:${shortName}`, fastModelId, socialRes.usage);
+          return `\n\n---\n🔥 **${shortName}**\n\n${socialRes.object.content}`;
         });
 
         const socialResults = await Promise.all(socialPromises);
@@ -452,7 +499,8 @@ export const processVideoFunction = inngest.createFunction(
         description: finalDescription,
         tags: megaOutput.seo.tags.join(", "),
         thumbnailText: megaOutput.winning_thumbnail_text,
-        analyst: megaOutput.analyst
+        analyst: megaOutput.analyst,
+        costEntries: cost.entries,
       };
     });
 
@@ -476,27 +524,51 @@ export const processVideoFunction = inngest.createFunction(
     // failure leaves the scene/brief unset and /api/og falls back to the legacy
     // template, so the user always gets a usable thumbnail and the pipeline never
     // dies over a thumbnail.
-    await step.run("generate-thumbnail", async () => {
+    const thumbStep = await step.run("generate-thumbnail", async () => {
+      const c = new AiCost();
       try {
-        await produceThumbnail({
-          videoId,
-          transcript,
-          analyst: aiResult.analyst,
-          thumbnailText: aiResult.thumbnailText,
-          title: aiResult.title,
-          directorsNote,
-          qualityMode,
-          refUrl: thumbnailRefUrl || null,
-        });
+        // Hard deadline so a hung image/AI call can never leave the video stuck on
+        // GENERATING_THUMBNAIL. On timeout we degrade to the /api/og template.
+        await withTimeout(
+          produceThumbnail({
+            videoId,
+            transcript,
+            analyst: aiResult.analyst,
+            thumbnailText: aiResult.thumbnailText,
+            title: aiResult.title,
+            directorsNote,
+            qualityMode,
+            refUrl: thumbnailRefUrl || null,
+            cost: c,
+          }),
+          Number(process.env.THUMBNAIL_TIMEOUT_MS) || 180000,
+          "thumbnail pipeline"
+        );
       } catch (e) {
-        console.error("[thumbnail] pipeline failed (non-fatal):", e);
+        console.error("[thumbnail] pipeline failed/timed out (non-fatal):", e);
       }
-      return { ok: true };
+      // Whatever was recorded before any failure is still billed (brief/scene/QC run
+      // in order), so partial work is accounted for.
+      return { entries: c.entries };
     });
 
-    // Step 8: Hand off to the user for review.
+    // Step 8: Persist the total AI spend, then hand off to the user for review. Cost
+    // entries were returned out of each step (Inngest-safe) and are merged here.
     await step.run("finalize-pending", async () => {
-      await supabase.from("videos").update({ status: "PENDING_APPROVAL" }).eq("id", videoId);
+      const total = AiCost.fromEntries([
+        ...transcriptCostEntries,
+        ...aiResult.costEntries,
+        ...thumbStep.entries,
+      ]);
+      await supabase
+        .from("videos")
+        .update({
+          status: "PENDING_APPROVAL",
+          ai_cost_usd: total.totalUsd,
+          ai_usage: total.summary(),
+          ai_model: total.primaryModel,
+        })
+        .eq("id", videoId);
     });
 
     return { success: true, videoId };

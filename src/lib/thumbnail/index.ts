@@ -3,6 +3,7 @@ import { buildThumbnailBrief, type ThumbnailBrief } from "./brief";
 import { resolveScene } from "./scene";
 import { qcThumbnail, type QcResult } from "./qc";
 import { loadBrandDna, getDefaultSubjectRef } from "./brand";
+import type { AiCost } from "@/lib/ai-cost";
 
 export interface ProduceThumbnailInput {
   videoId: string;
@@ -14,14 +15,25 @@ export interface ProduceThumbnailInput {
   qualityMode?: string;
   /** Optional per-video reference image (style or subject) uploaded by the user. */
   refUrl?: string | null;
+  /** Optional cost accumulator — records brief/scene/QC spend for this thumbnail run. */
+  cost?: AiCost;
 }
 
 /** Render the final composite through the Satori /api/og route and return PNG bytes. */
 async function renderComposite(videoId: string): Promise<Buffer> {
   const base = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-  const res = await fetch(`${base}/api/og?videoId=${videoId}&v=${Date.now()}`);
-  if (!res.ok) throw new Error(`Composite render failed: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  // Bound the request so a slow font/scene fetch inside /api/og can't hang the step.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 45000);
+  try {
+    const res = await fetch(`${base}/api/og?videoId=${videoId}&v=${Date.now()}`, {
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`Composite render failed: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -46,15 +58,18 @@ export async function produceThumbnail(input: ProduceThumbnailInput): Promise<vo
   const refUrls = [input.refUrl, subjectRef].filter((u): u is string => !!u);
 
   // 1. Art Director brief (persist immediately so /api/og can read text_layers).
-  const brief: ThumbnailBrief = await buildThumbnailBrief({
-    transcript: input.transcript,
-    analyst: input.analyst,
-    thumbnailText: input.thumbnailText,
-    title: input.title,
-    directorsNote: input.directorsNote,
-    brandDna,
-    qualityMode: input.qualityMode,
-  });
+  const brief: ThumbnailBrief = await buildThumbnailBrief(
+    {
+      transcript: input.transcript,
+      analyst: input.analyst,
+      thumbnailText: input.thumbnailText,
+      title: input.title,
+      directorsNote: input.directorsNote,
+      brandDna,
+      qualityMode: input.qualityMode,
+    },
+    input.cost
+  );
   await supabase.from("videos").update({ thumbnail_brief: brief }).eq("id", input.videoId);
 
   // 2. Generate → composite → QC, retrying on QC failure.
@@ -75,6 +90,7 @@ export async function produceThumbnail(input: ProduceThumbnailInput): Promise<vo
         qualityMode: input.qualityMode,
         refUrls,
         brandDna,
+        cost: input.cost,
         forceCustom: attempt > 1,
         // Swap in the real presenter's face for exact identity (the user's optional
         // reference wins, otherwise the default Kruptoey photo).
@@ -99,7 +115,7 @@ export async function produceThumbnail(input: ProduceThumbnailInput): Promise<vo
     }
 
     try {
-      qc = await qcThumbnail(new Uint8Array(png), brief);
+      qc = await qcThumbnail(new Uint8Array(png), brief, input.cost);
     } catch (e) {
       // QC is a safety net, not a gate — if it errors, accept the render.
       console.error("[thumbnail] QC errored, accepting current render:", e);

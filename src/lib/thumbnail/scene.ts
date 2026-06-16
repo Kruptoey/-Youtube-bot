@@ -2,9 +2,11 @@ import { supabaseAdmin as supabase } from "@/lib/supabase-admin";
 import { BRAND_KIT } from "./brand";
 import type { ThumbnailBrief } from "./brief";
 import { swapFace } from "./faceswap";
+import type { AiCost } from "@/lib/ai-cost";
 
 const STORAGE_BUCKET = "assets"; // reuse the existing bucket; no new bucket to provision
 const IMAGE_MODEL = process.env.GEMINI_IMAGE_MODEL || "gemini-2.5-flash-image";
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1";
 
 /** Fetch a remote image and return it as base64 + mime, or null on any failure. */
 async function fetchAsInlineData(
@@ -115,7 +117,7 @@ async function generateSceneImageGemini(
 async function generateSceneImageOpenAI(prompt: string, refUrls: string[]): Promise<Buffer> {
   const key = process.env.OPENAI_API_KEY;
   if (!key) throw new Error("OPENAI_API_KEY is not set.");
-  const model = process.env.OPENAI_IMAGE_MODEL || "gpt-image-1";
+  const model = OPENAI_IMAGE_MODEL;
   const size = "1536x1024";
 
   const readB64 = (json: { data?: Array<{ b64_json?: string }> }): Buffer => {
@@ -173,17 +175,24 @@ async function generateSceneImageOpenAI(prompt: string, refUrls: string[]): Prom
  * — notably the free-tier 429 on Gemini's image model — so the pipeline works out of
  * the box with an OpenAI key and gets cheaper automatically once Gemini billing is on.
  */
-export async function generateSceneImage(prompt: string, refUrls: string[]): Promise<Buffer> {
+export async function generateSceneImage(
+  prompt: string,
+  refUrls: string[]
+): Promise<{ buf: Buffer; model: string }> {
   const provider = (process.env.THUMBNAIL_IMAGE_PROVIDER || "auto").toLowerCase();
   const hasGemini = !!process.env.GEMINI_API_KEY;
   const hasOpenAI = !!process.env.OPENAI_API_KEY;
 
-  if (provider === "openai") return generateSceneImageOpenAI(prompt, refUrls);
-  if (provider === "gemini") return generateSceneImageGemini(prompt, refUrls);
+  if (provider === "openai") {
+    return { buf: await generateSceneImageOpenAI(prompt, refUrls), model: OPENAI_IMAGE_MODEL };
+  }
+  if (provider === "gemini") {
+    return { buf: await generateSceneImageGemini(prompt, refUrls), model: IMAGE_MODEL };
+  }
 
   if (hasGemini) {
     try {
-      return await generateSceneImageGemini(prompt, refUrls);
+      return { buf: await generateSceneImageGemini(prompt, refUrls), model: IMAGE_MODEL };
     } catch (e) {
       if (!hasOpenAI) throw e;
       console.warn(
@@ -192,7 +201,7 @@ export async function generateSceneImage(prompt: string, refUrls: string[]): Pro
       );
     }
   }
-  return generateSceneImageOpenAI(prompt, refUrls);
+  return { buf: await generateSceneImageOpenAI(prompt, refUrls), model: OPENAI_IMAGE_MODEL };
 }
 
 /** Upload a PNG buffer to the assets bucket under thumbnails/<sub>/ and return its public URL. */
@@ -233,6 +242,8 @@ export interface ResolveSceneOptions {
   /** Real presenter face URL — when set (and FAL_KEY present), the generated face is
    *  swapped for this exact identity. */
   faceSourceUrl?: string | null;
+  /** Optional cost accumulator — records the per-image spend when a fresh scene is generated. */
+  cost?: AiCost;
 }
 
 /**
@@ -255,7 +266,9 @@ export async function resolveScene(
   }
 
   const prompt = buildImagePrompt(brief, opts.brandDna);
-  let buf = await generateSceneImage(prompt, opts.refUrls);
+  const { buf: generated, model: imageModel } = await generateSceneImage(prompt, opts.refUrls);
+  let buf = generated;
+  opts.cost?.addImage("thumbnail:scene", imageModel);
 
   // Exact-identity layer: swap the AI-rendered face for the real presenter's face.
   // Best-effort — keep the generated face if FAL_KEY is absent or the swap fails.

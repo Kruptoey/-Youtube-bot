@@ -2,6 +2,7 @@ import { generateObject } from "ai";
 import { z } from "zod";
 import { createGoogleGenerativeAI } from "@ai-sdk/google";
 import { BRAND_KIT } from "./brand";
+import type { AiCost } from "@/lib/ai-cost";
 
 /**
  * The Art Director's structured brief. The DYNAMIC half of the design — it varies
@@ -79,7 +80,7 @@ export interface BriefInput {
  * creative lifting (titles/copy) already happened upstream; here we only translate
  * the winning angle into a concrete visual brief, anchored on the static brand kit.
  */
-export async function buildThumbnailBrief(input: BriefInput): Promise<ThumbnailBrief> {
+export async function buildThumbnailBrief(input: BriefInput, cost?: AiCost): Promise<ThumbnailBrief> {
   if (!process.env.GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is required for the thumbnail Art Director.");
   }
@@ -91,7 +92,7 @@ export async function buildThumbnailBrief(input: BriefInput): Promise<ThumbnailB
     : "";
   const brandDna = input.brandDna ? `\n\nChannel Brand DNA:\n${input.brandDna}` : "";
 
-  const { object } = await generateObject({
+  const { object, usage } = await generateObject({
     model: google(model),
     schema: ThumbnailBriefSchema,
     prompt:
@@ -111,5 +112,6 @@ export async function buildThumbnailBrief(input: BriefInput): Promise<ThumbnailB
       `- The background equations MUST match this lesson's topic. Use a TOPIC-specific scene_tag and set needs_custom_scene=true unless the exact topic was clearly produced before.`,
   });
 
+  cost?.addTokens("thumbnail:brief", model, usage);
   return object;
 }
